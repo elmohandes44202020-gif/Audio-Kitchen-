@@ -3,4 +3,5 @@ uvicorn[standard]
 python-multipart
 pydantic
 av
+numpy
 python-telegram-bot
