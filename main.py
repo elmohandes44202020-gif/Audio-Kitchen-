@@ -2,24 +2,22 @@ import os
 import uuid
 import asyncio
 import logging
+import mimetypes
 from pathlib import Path
-from typing import Optional
 from contextlib import asynccontextmanager
+from typing import Optional
 
 import av
 import numpy as np
 
-from av import AudioFrame, VideoFrame
-
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
-
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -31,511 +29,387 @@ from telegram.ext import (
 
 
 # ============================================================
+# CONFIGURATION
+# ============================================================
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+
+PORT = int(os.getenv("PORT", "8000"))
+
+BASE_DIR = Path(os.getenv("PYAV_MEDIA_DIR", "/tmp/pyav_media"))
+
+INPUT_DIR = BASE_DIR / "input"
+OUTPUT_DIR = BASE_DIR / "output"
+
+INPUT_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ============================================================
 # LOGGING
 # ============================================================
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 
-logger = logging.getLogger("pyav_media_studio")
+logger = logging.getLogger("pyav-server")
 
 
 # ============================================================
-# CONFIG
-# ============================================================
-
-BOT_TOKEN = os.getenv(
-    "BOT_TOKEN",
-    ""
-).strip()
-
-PORT = int(
-    os.getenv(
-        "PORT",
-        "8000"
-    )
-)
-
-BASE_DIR = Path(
-    os.getenv(
-        "MEDIA_DIR",
-        "/tmp/pyav_media"
-    )
-)
-
-INPUT_DIR = BASE_DIR / "input"
-OUTPUT_DIR = BASE_DIR / "output"
-
-INPUT_DIR.mkdir(
-    parents=True,
-    exist_ok=True
-)
-
-OUTPUT_DIR.mkdir(
-    parents=True,
-    exist_ok=True
-)
-
-
-# ============================================================
-# GLOBAL BOT
+# TELEGRAM APPLICATION
 # ============================================================
 
 telegram_application: Optional[Application] = None
 
 
 # ============================================================
-# USER STATE
+# USER STORAGE
 # ============================================================
 
 USER_FILES = {}
 USER_SETTINGS = {}
 
 
-def default_settings():
-    return {
-        "operation": "convert",
+DEFAULT_SETTINGS = {
+    "operation": "convert",
 
-        "start": None,
-        "end": None,
+    "trim_start": None,
+    "trim_end": None,
 
-        "volume": 1.0,
+    "volume": 1.0,
+    "speed": 1.0,
 
-        "speed": 1.0,
+    "width": None,
+    "height": None,
 
-        "width": None,
-        "height": None,
+    "fps": None,
 
-        "fps": None,
+    "sample_rate": None,
+    "channels": None,
 
-        "sample_rate": None,
-        "channels": None,
+    "video_bitrate": None,
+    "audio_bitrate": None,
 
-        "audio_bitrate": None,
-        "video_bitrate": None,
+    "fade_in": 0,
+    "fade_out": 0,
 
-        "remove_audio": False,
-        "extract_audio": False,
+    "remove_audio": False,
+    "extract_audio": False,
 
-        "output_format": None,
-    }
+    "output_format": None,
+}
 
 
-def get_settings(user_id):
+# ============================================================
+# GENERAL HELPERS
+# ============================================================
 
+def get_user_settings(user_id: int):
     if user_id not in USER_SETTINGS:
-        USER_SETTINGS[user_id] = default_settings()
+        USER_SETTINGS[user_id] = DEFAULT_SETTINGS.copy()
 
     return USER_SETTINGS[user_id]
 
 
-# ============================================================
-# FILE UTILITIES
-# ============================================================
+def reset_user_settings(user_id: int):
+    USER_SETTINGS[user_id] = DEFAULT_SETTINGS.copy()
 
-def safe_filename(filename):
 
-    filename = Path(
-        filename or "media"
-    ).name
+def safe_filename(name: str) -> str:
+    if not name:
+        return "media"
+
+    name = Path(name).name
 
     allowed = (
         "abcdefghijklmnopqrstuvwxyz"
         "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
         "0123456789"
-        "._-"
+        "._- "
     )
 
-    result = "".join(
-        c if c in allowed else "_"
-        for c in filename
-    )
+    name = "".join(c if c in allowed else "_" for c in name)
 
-    return result or "media"
+    return name[:180] or "media"
 
 
-def unique_path(directory, filename):
+def unique_path(directory: Path, filename: str) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
 
-    return directory / (
-        uuid.uuid4().hex
-        + "_"
-        + filename
-    )
+    original = Path(filename)
+
+    stem = original.stem
+    suffix = original.suffix
+
+    path = directory / filename
+
+    counter = 1
+
+    while path.exists():
+        path = directory / f"{stem}_{counter}{suffix}"
+        counter += 1
+
+    return path
 
 
 def cleanup_file(path):
-
-    if not path:
-        return
-
     try:
-        Path(path).unlink(
-            missing_ok=True
-        )
+        if path and Path(path).exists():
+            Path(path).unlink()
     except Exception:
-        pass
+        logger.exception("Could not delete file")
 
-
-# ============================================================
-# BITRATE
-# ============================================================
 
 def parse_bitrate(value):
-
     if value is None:
         return None
 
-    if isinstance(
-        value,
-        int
-    ):
+    if isinstance(value, int):
         return value
 
-    text = str(
-        value
-    ).strip().lower()
-
-    multiplier = 1
-
-    if text.endswith("k"):
-
-        multiplier = 1000
-        text = text[:-1]
-
-    elif text.endswith("m"):
-
-        multiplier = 1000000
-        text = text[:-1]
+    value = str(value).strip().lower()
 
     try:
+        if value.endswith("k"):
+            return int(float(value[:-1]) * 1000)
 
-        return int(
-            float(text)
-            * multiplier
-        )
+        if value.endswith("m"):
+            return int(float(value[:-1]) * 1000000)
+
+        return int(value)
 
     except Exception:
+        raise ValueError("Invalid bitrate")
 
-        return None
+
+def parse_float(value, minimum=None, maximum=None):
+    number = float(value)
+
+    if minimum is not None and number < minimum:
+        raise ValueError(f"Value must be >= {minimum}")
+
+    if maximum is not None and number > maximum:
+        raise ValueError(f"Value must be <= {maximum}")
+
+    return number
+
+
+def parse_int(value, minimum=None, maximum=None):
+    number = int(value)
+
+    if minimum is not None and number < minimum:
+        raise ValueError(f"Value must be >= {minimum}")
+
+    if maximum is not None and number > maximum:
+        raise ValueError(f"Value must be <= {maximum}")
+
+    return number
 
 
 # ============================================================
 # MEDIA INSPECTION
 # ============================================================
 
-def inspect_media(path):
-
-    container = None
-
+def inspect_media(path: str):
     result = {
         "filename": Path(path).name,
         "format": None,
         "duration": None,
         "bitrate": None,
-        "streams": [],
+        "size": None,
+        "video": [],
+        "audio": [],
     }
 
-    try:
+    path_obj = Path(path)
 
-        container = av.open(
-            str(path)
+    if path_obj.exists():
+        result["size"] = path_obj.stat().st_size
+
+    container = None
+
+    try:
+        container = av.open(path)
+
+        result["format"] = (
+            container.format.name
+            if container.format
+            else None
         )
 
-        if container.format:
-
-            result["format"] = (
-                container.format.name
-            )
-
         if container.duration is not None:
-
-            result["duration"] = (
-                float(
-                    container.duration
-                )
-                / float(av.time_base)
-            )
+            result["duration"] = container.duration / av.time_base
 
         if container.bit_rate:
-
-            result["bitrate"] = (
-                container.bit_rate
-            )
+            result["bitrate"] = container.bit_rate
 
         for stream in container.streams:
 
-            item = {
-                "index": stream.index,
-                "type": stream.type,
-                "codec": None,
-            }
-
-            if stream.codec_context:
-
-                item["codec"] = (
-                    stream.codec_context.name
+            if stream.type == "video":
+                result["video"].append(
+                    {
+                        "index": stream.index,
+                        "codec": (
+                            stream.codec_context.name
+                            if stream.codec_context
+                            else None
+                        ),
+                        "width": stream.codec_context.width,
+                        "height": stream.codec_context.height,
+                        "fps": (
+                            float(stream.average_rate)
+                            if stream.average_rate
+                            else None
+                        ),
+                        "pix_fmt": (
+                            stream.codec_context.pix_fmt
+                            if stream.codec_context
+                            else None
+                        ),
+                    }
                 )
 
-            if stream.type == "video":
-
-                item.update({
-                    "width": stream.width,
-                    "height": stream.height,
-                    "fps": (
-                        float(stream.average_rate)
-                        if stream.average_rate
-                        else None
-                    ),
-                })
-
             elif stream.type == "audio":
-
-                item.update({
-                    "sample_rate": stream.rate,
-                    "channels": stream.channels,
-                    "layout": (
-                        str(stream.layout)
-                        if stream.layout
-                        else None
-                    ),
-                })
-
-            result["streams"].append(
-                item
-            )
+                result["audio"].append(
+                    {
+                        "index": stream.index,
+                        "codec": (
+                            stream.codec_context.name
+                            if stream.codec_context
+                            else None
+                        ),
+                        "sample_rate": stream.codec_context.sample_rate,
+                        "channels": stream.codec_context.channels,
+                        "layout": (
+                            stream.layout.name
+                            if stream.layout
+                            else None
+                        ),
+                    }
+                )
 
     finally:
-
         if container:
-
-            try:
-                container.close()
-            except Exception:
-                pass
+            container.close()
 
     return result
-
-
-# ============================================================
-# STREAM HELPERS
-# ============================================================
-
-def find_video_stream(container):
-
-    for stream in container.streams:
-
-        if stream.type == "video":
-            return stream
-
-    return None
-
-
-def find_audio_stream(container):
-
-    for stream in container.streams:
-
-        if stream.type == "audio":
-            return stream
-
-    return None
 
 
 # ============================================================
 # CODEC SELECTION
 # ============================================================
 
-def choose_video_codec(format_name):
+def select_video_codec(output_format: str):
+    output_format = output_format.lower()
 
-    fmt = (
-        format_name or ""
-    ).lower()
+    if output_format in {"mp4", "m4v", "mov"}:
+        return "libx264"
 
-    if fmt in {
-        "mp4",
-        "mov",
-        "m4v",
-    }:
+    if output_format == "webm":
+        return "libvpx"
 
-        return "h264"
+    if output_format in {"mkv", "matroska"}:
+        return "libx264"
 
-    if fmt == "webm":
-
-        return "vp8"
-
-    if fmt in {
-        "mkv",
-        "matroska",
-    }:
-
-        return "h264"
-
-    return "h264"
+    return "libx264"
 
 
-def choose_audio_codec(format_name):
+def select_audio_codec(output_format: str):
+    output_format = output_format.lower()
 
-    fmt = (
-        format_name or ""
-    ).lower()
+    if output_format == "mp3":
+        return "libmp3lame"
 
-    if fmt == "mp3":
+    if output_format in {"ogg", "opus"}:
+        return "libopus"
 
-        return "mp3"
-
-    if fmt in {
-        "ogg",
-        "opus",
-    }:
-
-        return "opus"
-
-    if fmt == "flac":
-
+    if output_format == "flac":
         return "flac"
 
-    if fmt == "wav":
-
+    if output_format == "wav":
         return "pcm_s16le"
 
-    if fmt in {
-        "m4a",
-        "mp4",
-        "mov",
-    }:
-
+    if output_format in {"mp4", "m4a", "mov"}:
         return "aac"
 
     return "aac"
 
 
 # ============================================================
-# VIDEO PROCESSING
+# VIDEO FRAME PROCESSING
 # ============================================================
 
-def resize_video_frame(
-    frame,
-    width,
-    height,
-):
+def resize_video_frame(frame, width=None, height=None):
 
-    if not width or not height:
-
+    if not width and not height:
         return frame
 
+    target_width = width or frame.width
+    target_height = height or frame.height
+
     return frame.reformat(
-        width=int(width),
-        height=int(height),
+        width=target_width,
+        height=target_height,
+        format="yuv420p",
     )
 
 
 # ============================================================
-# AUDIO PROCESSING
+# AUDIO FRAME PROCESSING
 # ============================================================
 
-def process_audio_frame(
-    frame,
-    volume=1.0,
-):
+def process_audio_frame(frame, volume=1.0):
 
-    if volume is None:
-        volume = 1.0
-
-    if float(volume) == 1.0:
-
+    if volume == 1.0:
         return frame
 
     try:
-
         array = frame.to_ndarray()
 
-        array = (
-            array.astype(
-                np.float32
-            )
-            * float(volume)
+        array = array.astype(np.float32)
+
+        array *= float(volume)
+
+        array = np.clip(
+            array,
+            -32768,
+            32767,
         )
 
-        if np.issubdtype(
-            array.dtype,
-            np.integer
-        ):
+        array = array.astype(np.int16)
 
-            info = np.iinfo(
-                array.dtype
-            )
-
-            array = np.clip(
-                array,
-                info.min,
-                info.max,
-            )
-
-        else:
-
-            array = np.clip(
-                array,
-                -1.0,
-                1.0,
-            )
-
-        if array.dtype != frame.to_ndarray().dtype:
-
-            original = frame.to_ndarray().dtype
-
-            if np.issubdtype(
-                original,
-                np.integer
-            ):
-
-                info = np.iinfo(
-                    original
-                )
-
-                array = array.astype(
-                    original
-                )
-
-        new_frame = (
-            AudioFrame.from_ndarray(
-                array,
-                layout=frame.layout.name,
-            )
+        new_frame = av.AudioFrame.from_ndarray(
+            array,
+            layout=frame.layout.name,
         )
 
-        new_frame.sample_rate = (
-            frame.sample_rate
-        )
+        new_frame.sample_rate = frame.sample_rate
 
         if frame.pts is not None:
-
             new_frame.pts = frame.pts
 
-        new_frame.time_base = (
-            frame.time_base
-        )
+        new_frame.time_base = frame.time_base
 
         return new_frame
 
-    except Exception as e:
-
-        logger.warning(
-            "Audio volume processing failed: %s",
-            e,
+    except Exception:
+        logger.exception(
+            "Audio processing failed; returning original frame"
         )
 
         return frame
 
 
 # ============================================================
-# PYAV TRANSCODING ENGINE
+# MAIN PYAV PROCESSOR
 # ============================================================
 
 def process_media_pyav(
-    input_path,
-    output_path,
-    settings,
+    input_path: str,
+    output_path: str,
+    settings: dict,
 ):
 
     input_container = None
@@ -543,637 +417,440 @@ def process_media_pyav(
 
     try:
 
-        input_container = av.open(
-            str(input_path)
-        )
-
-        input_format = (
-            input_container.format.name
-            if input_container.format
-            else "mp4"
-        )
+        input_container = av.open(input_path)
 
         output_format = (
-            settings.get(
-                "output_format"
-            )
-            or input_format
+            settings.get("output_format")
+            or Path(output_path).suffix.lstrip(".")
+            or "mp4"
         )
 
-        output_format = (
-            str(output_format)
-            .lower()
-            .replace(
-                ".",
-                ""
-            )
-        )
+        output_format = output_format.lower()
+
+        # ----------------------------------------------------
+        # OUTPUT CONTAINER
+        # ----------------------------------------------------
 
         output_container = av.open(
-            str(output_path),
+            output_path,
             mode="w",
             format=output_format,
         )
 
-        video_stream = find_video_stream(
-            input_container
+        # ----------------------------------------------------
+        # INPUT STREAMS
+        # ----------------------------------------------------
+
+        input_video = None
+        input_audio = None
+
+        for stream in input_container.streams:
+
+            if stream.type == "video" and input_video is None:
+                input_video = stream
+
+            elif stream.type == "audio" and input_audio is None:
+                input_audio = stream
+
+        # ----------------------------------------------------
+        # SETTINGS
+        # ----------------------------------------------------
+
+        remove_audio = bool(
+            settings.get("remove_audio", False)
         )
 
-        audio_stream = find_audio_stream(
-            input_container
+        extract_audio = bool(
+            settings.get("extract_audio", False)
         )
 
-        output_video = None
-        output_audio = None
+        width = settings.get("width")
+        height = settings.get("height")
+
+        fps = settings.get("fps")
+
+        volume = float(
+            settings.get("volume", 1.0)
+        )
 
         speed = float(
-            settings.get(
-                "speed",
-                1.0
-            )
-            or 1.0
+            settings.get("speed", 1.0)
         )
 
-        if speed <= 0:
-            speed = 1.0
+        trim_start = settings.get("trim_start")
+        trim_end = settings.get("trim_end")
 
-        # ====================================================
-        # VIDEO OUTPUT
-        # ====================================================
+        audio_sample_rate = settings.get(
+            "sample_rate"
+        )
 
-        if (
-            video_stream
-            and not settings.get(
-                "extract_audio",
-                False
-            )
-        ):
+        video_bitrate = parse_bitrate(
+            settings.get("video_bitrate")
+        )
 
-            codec = choose_video_codec(
+        audio_bitrate = parse_bitrate(
+            settings.get("audio_bitrate")
+        )
+
+        # ----------------------------------------------------
+        # EXTRACT AUDIO MODE
+        # ----------------------------------------------------
+
+        if extract_audio:
+
+            if input_audio is None:
+                raise RuntimeError(
+                    "No audio stream found."
+                )
+
+            audio_codec = select_audio_codec(
                 output_format
             )
 
-            try:
-
-                output_video = (
-                    output_container.add_stream(
-                        codec
-                    )
-                )
-
-            except Exception as e:
-
-                logger.warning(
-                    "Primary video codec failed: %s",
-                    e,
-                )
-
-                source_codec = (
-                    video_stream.codec_context.name
-                )
-
-                output_video = (
-                    output_container.add_stream(
-                        source_codec
-                    )
-                )
-
-            width = (
-                settings.get("width")
-                or video_stream.width
-            )
-
-            height = (
-                settings.get("height")
-                or video_stream.height
-            )
-
-            output_video.width = int(
-                width
-            )
-
-            output_video.height = int(
-                height
-            )
-
-            fps = settings.get(
-                "fps"
-            )
-
-            if fps:
-
-                output_video.average_rate = (
-                    float(fps)
-                )
-
-            elif video_stream.average_rate:
-
-                output_video.average_rate = (
-                    video_stream.average_rate
-                )
-
-            if settings.get(
-                "video_bitrate"
-            ):
-
-                bitrate = parse_bitrate(
-                    settings[
-                        "video_bitrate"
-                    ]
-                )
-
-                if bitrate:
-
-                    output_video.bit_rate = (
-                        bitrate
-                    )
-
-        # ====================================================
-        # AUDIO OUTPUT
-        # ====================================================
-
-        if (
-            audio_stream
-            and not settings.get(
-                "remove_audio",
-                False
-            )
-        ):
-
-            if settings.get(
-                "extract_audio",
-                False
-            ):
-
-                audio_format = (
-                    output_format
-                    or "mp3"
-                )
-
-            else:
-
-                audio_format = (
-                    output_format
-                )
-
-            codec = choose_audio_codec(
-                audio_format
-            )
-
-            source_rate = (
-                audio_stream.rate
+            audio_rate = (
+                audio_sample_rate
+                or input_audio.codec_context.sample_rate
                 or 44100
             )
 
-            requested_rate = (
-                settings.get(
-                    "sample_rate"
-                )
-                or source_rate
+            audio_stream = output_container.add_stream(
+                audio_codec,
+                rate=audio_rate,
             )
 
-            target_rate = int(
-                requested_rate
-            )
+            if audio_bitrate:
+                audio_stream.bit_rate = audio_bitrate
 
-            # Speed changes playback duration
-            # by changing the output sample rate.
-            if (
-                speed != 1.0
-                and not settings.get(
-                    "sample_rate"
-                )
-            ):
+        else:
 
-                target_rate = max(
-                    8000,
-                    min(
-                        192000,
-                        int(
-                            source_rate
-                            * speed
-                        )
-                    )
+            audio_stream = None
+
+            if input_audio is not None and not remove_audio:
+
+                audio_codec = select_audio_codec(
+                    output_format
                 )
 
-            try:
-
-                output_audio = (
-                    output_container.add_stream(
-                        codec,
-                        rate=target_rate,
-                    )
+                audio_rate = (
+                    audio_sample_rate
+                    or input_audio.codec_context.sample_rate
+                    or 44100
                 )
 
-            except Exception as e:
-
-                logger.warning(
-                    "Primary audio codec failed: %s",
-                    e,
+                audio_stream = output_container.add_stream(
+                    audio_codec,
+                    rate=audio_rate,
                 )
 
-                output_audio = (
-                    output_container.add_stream(
-                        audio_stream.codec_context.name,
-                        rate=target_rate,
-                    )
-                )
+                if audio_bitrate:
+                    audio_stream.bit_rate = audio_bitrate
 
-            if settings.get(
-                "audio_bitrate"
-            ):
+        # ----------------------------------------------------
+        # VIDEO OUTPUT STREAM
+        # ----------------------------------------------------
 
-                bitrate = parse_bitrate(
-                    settings[
-                        "audio_bitrate"
-                    ]
-                )
+        video_stream = None
 
-                if bitrate:
-
-                    output_audio.bit_rate = (
-                        bitrate
-                    )
-
-        # ====================================================
-        # AUDIO RESAMPLER
-        # ====================================================
-
-        resampler = None
-
-        if audio_stream and output_audio:
-
-            try:
-
-                target_rate = (
-                    output_audio.rate
-                )
-
-                target_layout = (
-                    str(
-                        audio_stream.layout
-                    )
-                    if audio_stream.layout
-                    else None
-                )
-
-                resampler = (
-                    av.audio.resampler.AudioResampler(
-                        format="fltp",
-                        layout=target_layout,
-                        rate=target_rate,
-                    )
-                )
-
-            except Exception as e:
-
-                logger.warning(
-                    "Audio resampler unavailable: %s",
-                    e,
-                )
-
-                resampler = None
-
-        # ====================================================
-        # DECODE
-        # ====================================================
-
-        streams = []
-
-        if video_stream:
-            streams.append(
-                video_stream
-            )
-
-        if audio_stream:
-            streams.append(
-                audio_stream
-            )
-
-        start = settings.get(
-            "start"
-        )
-
-        end = settings.get(
-            "end"
-        )
-
-        for frame in input_container.decode(
-            *streams
+        if (
+            input_video is not None
+            and not extract_audio
         ):
 
-            # =================================================
-            # VIDEO FRAME
-            # =================================================
+            video_codec = select_video_codec(
+                output_format
+            )
 
-            if isinstance(
-                frame,
-                VideoFrame
-            ):
+            input_width = (
+                input_video.codec_context.width
+            )
 
-                pts_seconds = None
+            input_height = (
+                input_video.codec_context.height
+            )
+
+            output_width = (
+                width or input_width
+            )
+
+            output_height = (
+                height or input_height
+            )
+
+            source_rate = (
+                input_video.average_rate
+            )
+
+            output_rate = fps or source_rate
+
+            if output_rate:
+                video_stream = output_container.add_stream(
+                    video_codec,
+                    rate=output_rate,
+                )
+            else:
+                video_stream = output_container.add_stream(
+                    video_codec
+                )
+
+            video_stream.width = output_width
+            video_stream.height = output_height
+
+            if video_codec in {"libx264", "h264"}:
+                video_stream.pix_fmt = "yuv420p"
+
+            if video_bitrate:
+                video_stream.bit_rate = video_bitrate
+
+        # ----------------------------------------------------
+        # DECODE + ENCODE
+        # ----------------------------------------------------
+
+        for packet in input_container.demux():
+
+            if packet.stream.type not in {
+                "video",
+                "audio",
+            }:
+                continue
+
+            try:
+                frames = packet.decode()
+            except Exception:
+                logger.exception(
+                    "Could not decode packet"
+                )
+                continue
+
+            for frame in frames:
+
+                # ==========================================
+                # VIDEO
+                # ==========================================
 
                 if (
-                    frame.pts is not None
-                    and frame.time_base is not None
+                    frame.type == "video"
+                    and video_stream is not None
                 ):
 
-                    try:
+                    timestamp = None
 
-                        pts_seconds = float(
+                    if frame.pts is not None:
+                        timestamp = float(
                             frame.pts
                             * frame.time_base
                         )
 
-                    except Exception:
-                        pass
+                    # ------------------------------
+                    # TRIM
+                    # ------------------------------
 
-                if (
-                    start is not None
-                    and pts_seconds is not None
-                    and pts_seconds < float(start)
-                ):
+                    if (
+                        timestamp is not None
+                        and trim_start is not None
+                        and timestamp < trim_start
+                    ):
+                        continue
 
-                    continue
+                    if (
+                        timestamp is not None
+                        and trim_end is not None
+                        and timestamp > trim_end
+                    ):
+                        continue
 
-                if (
-                    end is not None
-                    and pts_seconds is not None
-                    and pts_seconds > float(end)
-                ):
-
-                    continue
-
-                if output_video:
+                    # ------------------------------
+                    # RESIZE
+                    # ------------------------------
 
                     frame = resize_video_frame(
                         frame,
-                        settings.get(
-                            "width"
-                        ),
-                        settings.get(
-                            "height"
-                        ),
+                        width,
+                        height,
                     )
 
-                    try:
+                    # ------------------------------
+                    # PIXEL FORMAT
+                    # ------------------------------
+
+                    if video_stream.codec_context.name in {
+                        "libx264",
+                        "h264",
+                    }:
 
                         frame = frame.reformat(
                             format="yuv420p"
                         )
 
-                    except Exception:
+                    # ------------------------------
+                    # SPEED
+                    # ------------------------------
 
-                        pass
-
-                    # Change PTS for playback speed.
-                    if (
-                        speed != 1.0
-                        and frame.pts is not None
-                    ):
-
-                        frame.pts = int(
-                            frame.pts
-                            / speed
-                        )
+                    if speed != 1.0:
+                        if frame.pts is not None:
+                            frame.pts = int(
+                                frame.pts / speed
+                            )
 
                     try:
 
-                        for packet in (
-                            output_video.encode(
-                                frame
-                            )
+                        for encoded_packet in video_stream.encode(
+                            frame
                         ):
-
                             output_container.mux(
-                                packet
+                                encoded_packet
                             )
 
-                    except Exception as e:
-
-                        raise RuntimeError(
-                            f"Video encoding failed: {e}"
+                    except Exception:
+                        logger.exception(
+                            "Video encoding error"
                         )
 
-            # =================================================
-            # AUDIO FRAME
-            # =================================================
+                # ==========================================
+                # AUDIO
+                # ==========================================
 
-            elif isinstance(
-                frame,
-                AudioFrame
-            ):
-
-                pts_seconds = None
-
-                if (
-                    frame.pts is not None
-                    and frame.time_base is not None
+                elif (
+                    frame.type == "audio"
+                    and audio_stream is not None
                 ):
 
-                    try:
+                    timestamp = None
 
-                        pts_seconds = float(
+                    if frame.pts is not None:
+                        timestamp = float(
                             frame.pts
                             * frame.time_base
                         )
 
-                    except Exception:
-                        pass
+                    # ------------------------------
+                    # TRIM
+                    # ------------------------------
 
-                if (
-                    start is not None
-                    and pts_seconds is not None
-                    and pts_seconds < float(start)
-                ):
+                    if (
+                        timestamp is not None
+                        and trim_start is not None
+                        and timestamp < trim_start
+                    ):
+                        continue
 
-                    continue
+                    if (
+                        timestamp is not None
+                        and trim_end is not None
+                        and timestamp > trim_end
+                    ):
+                        continue
 
-                if (
-                    end is not None
-                    and pts_seconds is not None
-                    and pts_seconds > float(end)
-                ):
-
-                    continue
-
-                if output_audio:
+                    # ------------------------------
+                    # VOLUME
+                    # ------------------------------
 
                     frame = process_audio_frame(
                         frame,
-                        settings.get(
-                            "volume",
-                            1.0
-                        ),
+                        volume,
                     )
 
-                    # -----------------------------------------
-                    # Resample audio
-                    # -----------------------------------------
+                    # ------------------------------
+                    # SPEED
+                    #
+                    # We intentionally don't attempt
+                    # dangerous audio time-stretching
+                    # here. Volume and trimming remain
+                    # fully PyAV based.
+                    # ------------------------------
 
-                    frames_to_encode = [frame]
+                    try:
 
-                    if resampler:
-
-                        try:
-
-                            resampled = (
-                                resampler.resample(
-                                    frame
-                                )
-                            )
-
-                            if resampled:
-
-                                if isinstance(
-                                    resampled,
-                                    list
-                                ):
-
-                                    frames_to_encode = (
-                                        resampled
-                                    )
-
-                                else:
-
-                                    frames_to_encode = [
-                                        resampled
-                                    ]
-
-                        except Exception as e:
-
-                            logger.warning(
-                                "Audio resampling failed: %s",
-                                e,
-                            )
-
-                    for audio_frame in (
-                        frames_to_encode
-                    ):
-
-                        if (
-                            speed != 1.0
-                            and audio_frame.pts is not None
+                        for encoded_packet in audio_stream.encode(
+                            frame
                         ):
-
-                            audio_frame.pts = int(
-                                audio_frame.pts
-                                / speed
+                            output_container.mux(
+                                encoded_packet
                             )
 
-                        try:
-
-                            for packet in (
-                                output_audio.encode(
-                                    audio_frame
-                                )
-                            ):
-
-                                output_container.mux(
-                                    packet
-                                )
-
-                        except Exception as e:
-
-                            raise RuntimeError(
-                                f"Audio encoding failed: {e}"
-                            )
-
-        # ====================================================
-        # FLUSH VIDEO
-        # ====================================================
-
-        if output_video:
-
-            for packet in (
-                output_video.encode()
-            ):
-
-                output_container.mux(
-                    packet
-                )
-
-        # ====================================================
-        # FLUSH AUDIO
-        # ====================================================
-
-        if output_audio:
-
-            if resampler:
-
-                try:
-
-                    flushed = (
-                        resampler.resample(
-                            None
+                    except Exception:
+                        logger.exception(
+                            "Audio encoding error"
                         )
+
+        # ----------------------------------------------------
+        # FLUSH VIDEO
+        # ----------------------------------------------------
+
+        if video_stream is not None:
+
+            try:
+
+                for encoded_packet in video_stream.encode():
+                    output_container.mux(
+                        encoded_packet
                     )
 
-                    if flushed:
-
-                        if not isinstance(
-                            flushed,
-                            list
-                        ):
-
-                            flushed = [
-                                flushed
-                            ]
-
-                        for frame in flushed:
-
-                            for packet in (
-                                output_audio.encode(
-                                    frame
-                                )
-                            ):
-
-                                output_container.mux(
-                                    packet
-                                )
-
-                except Exception as e:
-
-                    logger.warning(
-                        "Audio resampler flush failed: %s",
-                        e,
-                    )
-
-            for packet in (
-                output_audio.encode()
-            ):
-
-                output_container.mux(
-                    packet
+            except Exception:
+                logger.exception(
+                    "Video encoder flush error"
                 )
 
-        # ====================================================
+        # ----------------------------------------------------
+        # FLUSH AUDIO
+        # ----------------------------------------------------
+
+        if audio_stream is not None:
+
+            try:
+
+                for encoded_packet in audio_stream.encode():
+                    output_container.mux(
+                        encoded_packet
+                    )
+
+            except Exception:
+                logger.exception(
+                    "Audio encoder flush error"
+                )
+
+        # ----------------------------------------------------
         # CLOSE
-        # ====================================================
+        # ----------------------------------------------------
 
         output_container.close()
-
         output_container = None
 
-        return str(
-            output_path
+        input_container.close()
+        input_container = None
+
+        if not Path(output_path).exists():
+            raise RuntimeError(
+                "Output file was not created."
+            )
+
+        if Path(output_path).stat().st_size <= 0:
+            raise RuntimeError(
+                "Output file is empty."
+            )
+
+        return output_path
+
+    except Exception:
+
+        logger.exception(
+            "PyAV processing failed"
         )
+
+        raise
 
     finally:
 
-        if input_container:
-
-            try:
+        try:
+            if input_container:
                 input_container.close()
-            except Exception:
-                pass
+        except Exception:
+            pass
 
-        if output_container:
-
-            try:
+        try:
+            if output_container:
                 output_container.close()
-            except Exception:
-                pass
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -1181,12 +858,20 @@ def process_media_pyav(
 # ============================================================
 
 @asynccontextmanager
-async def lifespan(application):
+async def lifespan(app: FastAPI):
 
     global telegram_application
 
+    logger.info("========================================")
+    logger.info("Starting PyAV Media Server")
+    logger.info("========================================")
+
     logger.info(
-        "FastAPI starting..."
+        "External FFmpeg executable: DISABLED"
+    )
+
+    logger.info(
+        "PyAV media engine: ENABLED"
     )
 
     if BOT_TOKEN:
@@ -1199,7 +884,7 @@ async def lifespan(application):
                 .build()
             )
 
-            register_handlers(
+            register_bot_handlers(
                 telegram_application
             )
 
@@ -1213,9 +898,9 @@ async def lifespan(application):
                     allowed_updates=Update.ALL_TYPES
                 )
 
-            logger.info(
-                "Telegram bot started successfully."
-            )
+                logger.info(
+                    "Telegram bot started successfully."
+                )
 
         except Exception:
 
@@ -1228,14 +913,15 @@ async def lifespan(application):
     else:
 
         logger.warning(
-            "BOT_TOKEN is not configured."
+            "BOT_TOKEN is not configured. "
+            "Telegram bot is disabled."
         )
 
     yield
 
-    logger.info(
-        "FastAPI shutting down..."
-    )
+    # --------------------------------------------------------
+    # SHUTDOWN
+    # --------------------------------------------------------
 
     if telegram_application:
 
@@ -1249,10 +935,14 @@ async def lifespan(application):
 
             await telegram_application.shutdown()
 
+            logger.info(
+                "Telegram bot stopped."
+            )
+
         except Exception:
 
             logger.exception(
-                "Error while shutting down Telegram bot."
+                "Telegram shutdown error"
             )
 
 
@@ -1260,8 +950,8 @@ app = FastAPI(
     title="PyAV Professional Media Studio",
     version="3.0.0",
     description=(
-        "Interactive Telegram media processing "
-        "server powered by PyAV."
+        "Professional media processing API powered by PyAV. "
+        "No external FFmpeg executable is called."
     ),
     lifespan=lifespan,
 )
@@ -1277,14 +967,24 @@ async def root():
     return {
         "status": "online",
         "service": "PyAV Professional Media Studio",
+        "version": "3.0.0",
         "engine": "PyAV",
         "external_ffmpeg": False,
         "telegram_bot": bool(
-            BOT_TOKEN
+            telegram_application
         ),
-        "version": "3.0.0",
+        "endpoints": {
+            "health": "/health",
+            "bot_status": "/bot-status",
+            "media_info": "/info",
+            "process": "/process",
+        },
     }
 
+
+# ============================================================
+# HEALTH
+# ============================================================
 
 @app.get("/health")
 async def health():
@@ -1300,30 +1000,52 @@ async def health():
 
 
 # ============================================================
-# API INFO
+# BOT STATUS
+# ============================================================
+
+@app.get("/bot-status")
+async def bot_status():
+
+    return {
+        "configured": bool(BOT_TOKEN),
+        "running": bool(
+            telegram_application
+        ),
+        "status": (
+            "running"
+            if telegram_application
+            else (
+                "token_missing"
+                if not BOT_TOKEN
+                else "not_running"
+            )
+        ),
+    }
+
+
+# ============================================================
+# INFO API
 # ============================================================
 
 @app.post("/info")
-async def api_info(
+async def media_info(
     file: UploadFile = File(...)
 ):
 
-    filename = safe_filename(
-        file.filename
+    suffix = (
+        Path(file.filename or "media")
+        .suffix
+        or ".bin"
     )
 
-    path = unique_path(
-        INPUT_DIR,
-        filename
+    temp_path = (
+        INPUT_DIR
+        / f"{uuid.uuid4().hex}{suffix}"
     )
 
     try:
 
-        with open(
-            path,
-            "wb"
-        ) as output:
-
+        with open(temp_path, "wb") as output:
             while True:
 
                 chunk = await file.read(
@@ -1333,38 +1055,41 @@ async def api_info(
                 if not chunk:
                     break
 
-                output.write(
-                    chunk
-                )
+                output.write(chunk)
 
-        return await asyncio.to_thread(
-            inspect_media,
-            str(path)
+        result = inspect_media(
+            str(temp_path)
+        )
+
+        return result
+
+    except Exception as exc:
+
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
         )
 
     finally:
 
-        cleanup_file(
-            path
-        )
+        cleanup_file(temp_path)
 
 
 # ============================================================
-# API PROCESS
+# PROCESS API
 # ============================================================
 
 @app.post("/process")
-async def api_process(
+async def process_api(
     file: UploadFile = File(...),
 
-    output_format: Optional[str] = None,
+    output_format: str = "mp4",
 
-    start: Optional[float] = None,
-    end: Optional[float] = None,
+    trim_start: Optional[float] = None,
+    trim_end: Optional[float] = None,
 
-    volume: Optional[float] = 1.0,
-
-    speed: Optional[float] = 1.0,
+    volume: float = 1.0,
+    speed: float = 1.0,
 
     width: Optional[int] = None,
     height: Optional[int] = None,
@@ -1373,28 +1098,77 @@ async def api_process(
 
     sample_rate: Optional[int] = None,
 
-    audio_bitrate: Optional[str] = None,
     video_bitrate: Optional[str] = None,
+    audio_bitrate: Optional[str] = None,
 
     remove_audio: bool = False,
     extract_audio: bool = False,
 ):
 
-    original_name = safe_filename(
-        file.filename
+    if speed <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Speed must be greater than 0.",
+        )
+
+    if volume < 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Volume cannot be negative.",
+        )
+
+    allowed_formats = {
+        "mp4",
+        "mkv",
+        "mov",
+        "webm",
+        "m4a",
+        "mp3",
+        "wav",
+        "flac",
+        "ogg",
+    }
+
+    output_format = output_format.lower().strip()
+
+    if output_format not in allowed_formats:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Unsupported output format. "
+                f"Allowed: {sorted(allowed_formats)}"
+            ),
+        )
+
+    input_suffix = (
+        Path(file.filename or "media")
+        .suffix
+        or ".bin"
     )
 
-    input_path = unique_path(
-        INPUT_DIR,
-        original_name
+    input_path = (
+        INPUT_DIR
+        / f"{uuid.uuid4().hex}{input_suffix}"
+    )
+
+    original_name = safe_filename(
+        file.filename or "media"
+    )
+
+    output_name = (
+        Path(original_name).stem
+        + "_processed."
+        + output_format
+    )
+
+    output_path = unique_path(
+        OUTPUT_DIR,
+        output_name,
     )
 
     try:
 
-        with open(
-            input_path,
-            "wb"
-        ) as output:
+        with open(input_path, "wb") as output:
 
             while True:
 
@@ -1405,123 +1179,61 @@ async def api_process(
                 if not chunk:
                     break
 
-                output.write(
-                    chunk
-                )
+                output.write(chunk)
 
-        extension = (
-            output_format
-            or input_path.suffix.lstrip(".")
-        )
+        settings = {
+            "output_format": output_format,
 
-        if extract_audio:
-
-            extension = (
-                output_format
-                or "mp3"
-            )
-
-        extension = (
-            extension
-            .lower()
-            .replace(
-                ".",
-                ""
-            )
-        )
-
-        output_name = (
-            f"{input_path.stem}"
-            f"_processed."
-            f"{extension}"
-        )
-
-        output_path = (
-            OUTPUT_DIR
-            / output_name
-        )
-
-        settings = default_settings()
-
-        settings.update({
-
-            "output_format": extension,
-
-            "start": start,
-
-            "end": end,
+            "trim_start": trim_start,
+            "trim_end": trim_end,
 
             "volume": volume,
-
             "speed": speed,
 
             "width": width,
-
             "height": height,
 
             "fps": fps,
 
             "sample_rate": sample_rate,
 
-            "audio_bitrate": (
-                audio_bitrate
-            ),
+            "video_bitrate": video_bitrate,
+            "audio_bitrate": audio_bitrate,
 
-            "video_bitrate": (
-                video_bitrate
-            ),
-
-            "remove_audio": (
-                remove_audio
-            ),
-
-            "extract_audio": (
-                extract_audio
-            ),
-        })
+            "remove_audio": remove_audio,
+            "extract_audio": extract_audio,
+        }
 
         await asyncio.to_thread(
             process_media_pyav,
-            input_path,
-            output_path,
+            str(input_path),
+            str(output_path),
             settings,
         )
 
-        if not output_path.exists():
-
-            raise HTTPException(
-                status_code=500,
-                detail="Processing failed."
-            )
-
         return FileResponse(
-            path=output_path,
+            path=str(output_path),
             filename=output_name,
             media_type=(
-                "application/octet-stream"
+                mimetypes.guess_type(
+                    output_name
+                )[0]
+                or "application/octet-stream"
             ),
         )
 
-    except HTTPException:
+    except Exception as exc:
 
-        raise
-
-    except Exception as e:
-
-        logger.exception(
-            "API processing error"
-        )
+        cleanup_file(output_path)
 
         raise HTTPException(
             status_code=500,
-            detail=str(e),
+            detail=str(exc),
         )
 
     finally:
 
-        cleanup_file(
-            input_path
-        )
+        cleanup_file(input_path)
 
 
 # ============================================================
@@ -1530,186 +1242,152 @@ async def api_process(
 
 def main_keyboard():
 
-    return InlineKeyboardMarkup([
+    keyboard = [
 
         [
             InlineKeyboardButton(
-                "✂️ قص",
-                callback_data="trim"
+                "✂️ قص الفيديو",
+                callback_data="trim",
             ),
             InlineKeyboardButton(
                 "🔊 الصوت",
-                callback_data="volume"
+                callback_data="volume",
             ),
         ],
 
         [
             InlineKeyboardButton(
                 "⚡ السرعة",
-                callback_data="speed"
+                callback_data="speed",
             ),
             InlineKeyboardButton(
                 "📐 الدقة",
-                callback_data="resolution"
+                callback_data="resolution",
             ),
         ],
 
         [
             InlineKeyboardButton(
                 "🎞 FPS",
-                callback_data="fps"
+                callback_data="fps",
             ),
             InlineKeyboardButton(
                 "🔄 الصيغة",
-                callback_data="format"
+                callback_data="format",
+            ),
+        ],
+
+        [
+            InlineKeyboardButton(
+                "🎚 Bitrate",
+                callback_data="bitrate",
+            ),
+            InlineKeyboardButton(
+                "🎛 Sample Rate",
+                callback_data="sample",
             ),
         ],
 
         [
             InlineKeyboardButton(
                 "🎵 استخراج الصوت",
-                callback_data="extract"
+                callback_data="extract",
             ),
             InlineKeyboardButton(
                 "🔇 كتم الصوت",
-                callback_data="mute"
+                callback_data="mute",
             ),
         ],
 
         [
             InlineKeyboardButton(
-                "🎚 Audio Bitrate",
-                callback_data="audio_bitrate"
-            ),
-            InlineKeyboardButton(
-                "🎚 Video Bitrate",
-                callback_data="video_bitrate"
+                "ℹ️ معلومات الملف",
+                callback_data="info",
             ),
         ],
 
         [
             InlineKeyboardButton(
-                "🎛 Sample Rate",
-                callback_data="sample"
-            ),
-            InlineKeyboardButton(
-                "ℹ️ معلومات",
-                callback_data="info"
+                "🚀 تنفيذ المعالجة",
+                callback_data="process",
             ),
         ],
 
         [
-            InlineKeyboardButton(
-                "⚙️ الإعدادات الحالية",
-                callback_data="settings"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "🚀 تنفيذ",
-                callback_data="process"
-            ),
             InlineKeyboardButton(
                 "🔄 إعادة ضبط",
-                callback_data="reset"
+                callback_data="reset",
             ),
         ],
 
-        [
-            InlineKeyboardButton(
-                "📖 شرح الاستخدام",
-                callback_data="help"
-            ),
-        ],
-    ])
+    ]
 
-
-def back_keyboard():
-
-    return InlineKeyboardMarkup([
-
-        [
-            InlineKeyboardButton(
-                "↩️ رجوع",
-                callback_data="back"
-            ),
-
-            InlineKeyboardButton(
-                "❌ إلغاء",
-                callback_data="cancel"
-            ),
-        ]
-
-    ])
+    return InlineKeyboardMarkup(keyboard)
 
 
 # ============================================================
-# START MESSAGE
+# TELEGRAM START
 # ============================================================
-
-START_TEXT = """
-🎬 PyAV Professional Media Studio
-
-مرحبًا بك 👋
-
-هذا البوت يحول السيرفر إلى استوديو
-تفاعلي لمعالجة الفيديو والصوت.
-
-🧠 محرك المعالجة:
-PyAV
-
-🚫 لا يتم تشغيل FFmpeg executable.
-
-━━━━━━━━━━━━━━━━━━
-
-📤 ابدأ بإرسال:
-
-🎥 فيديو
-🎵 ملف صوتي
-📄 ملف Media
-
-ثم ستظهر لك أدوات التحكم.
-
-━━━━━━━━━━━━━━━━━━
-
-✂️ قص
-🔊 الصوت
-⚡ السرعة
-📐 الدقة
-🎞 FPS
-🔄 الصيغة
-🎵 استخراج الصوت
-🔇 كتم الصوت
-🎚 Bitrate
-🎛 Sample Rate
-
-ثم اضغط:
-
-🚀 تنفيذ
-
-━━━━━━━━━━━━━━━━━━
-
-📖 لمعرفة طريقة الاستخدام:
-اضغط «شرح الاستخدام».
-"""
-
 
 async def start_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    if not update.message:
-        return
+    user = update.effective_user
 
-    context.user_data.pop(
-        "awaiting",
-        None
-    )
+    if user:
+
+        reset_user_settings(
+            user.id
+        )
+
+    text = """
+🎬 مرحبًا بك في PyAV Media Studio
+
+محرك معالجة احترافي للفيديو والصوت يعمل باستخدام:
+
+⚙️ PyAV
+🚫 بدون تشغيل برنامج FFmpeg الخارجي
+
+━━━━━━━━━━━━━━━━━━
+
+📤 أرسل لي:
+
+🎥 فيديو
+🎵 ملف صوتي
+📄 Video Document
+📎 Audio Document
+
+ثم ستظهر لك لوحة التحكم.
+
+━━━━━━━━━━━━━━━━━━
+
+🎛 الأدوات:
+
+✂️ قص
+🔊 التحكم في الصوت
+⚡ السرعة
+📐 تغيير الدقة
+🎞 تغيير FPS
+🔄 تغيير الصيغة
+🎚 Bitrate
+🎛 Sample Rate
+🎵 استخراج الصوت
+🔇 كتم الصوت
+ℹ️ معلومات الملف
+
+━━━━━━━━━━━━━━━━━━
+
+بعد اختيار الإعدادات اضغط:
+
+🚀 تنفيذ المعالجة
+
+وسيتم إرسال الملف الناتج لك.
+"""
 
     await update.message.reply_text(
-        START_TEXT,
+        text,
         reply_markup=main_keyboard(),
     )
 
@@ -1718,105 +1396,126 @@ async def start_command(
 # HELP
 # ============================================================
 
-HELP_TEXT = """
-📖 شرح استخدام PyAV Studio
-
-1️⃣ أرسل الفيديو أو الملف الصوتي.
-
-2️⃣ بعد رفع الملف ستظهر لوحة التحكم.
-
-3️⃣ اختر العملية المطلوبة.
-
-4️⃣ إذا كانت العملية تحتاج قيمة،
-سيطلب منك البوت إدخالها.
-
-5️⃣ بعد الانتهاء من الإعدادات،
-اضغط ⚙️ الإعدادات الحالية
-للتأكد من كل شيء.
-
-6️⃣ اضغط 🚀 تنفيذ.
-
-7️⃣ انتظر حتى ينتهي PyAV من المعالجة.
-
-8️⃣ سيُرسل الملف الناتج إليك.
-
-━━━━━━━━━━━━━━━━━━
-
-🎥 الفيديو
-
-✂️ القص:
-أدخل:
-10 60
-
-يعني من الثانية 10
-إلى الثانية 60.
-
-📐 الدقة:
-اختر دقة جاهزة أو أدخل:
-1920 1080
-
-🎞 FPS:
-مثال:
-30
-أو:
-60
-
-⚡ السرعة:
-مثال:
-0.5
-1
-1.5
-2
-
-🔄 الصيغة:
-MP4 / MKV / WEBM
-أو الصيغ الصوتية.
-
-━━━━━━━━━━━━━━━━━━
-
-🎵 الصوت
-
-🔊 الصوت:
-1.5 = زيادة 50%
-0.5 = خفض الصوت للنصف.
-
-🎵 استخراج الصوت:
-يحاول إنشاء ملف صوتي مستقل.
-
-🔇 كتم الصوت:
-يزيل مسار الصوت من الناتج.
-
-🎛 Sample Rate:
-44100
-48000
-
-━━━━━━━━━━━━━━━━━━
-
-⚠️ ملاحظات
-
-المعالجة تعتمد على قدرات PyAV
-والـ codecs الموجودة ضمن بيئة PyAV.
-
-كما توجد حدود لحجم الملفات
-تفرضها Telegram والسيرفر.
-"""
-
-
 async def help_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    if update.message:
+    text = """
+📚 شرح الاستخدام
 
-        await update.message.reply_text(
-            HELP_TEXT,
-            reply_markup=main_keyboard(),
-        )
+1️⃣ أرسل الفيديو أو الملف الصوتي للبوت.
+
+2️⃣ اختر الوظيفة المطلوبة من الأزرار.
+
+3️⃣ أدخل القيمة عندما يطلبها البوت.
+
+4️⃣ يمكنك تغيير أكثر من إعداد.
+
+5️⃣ اضغط 🚀 تنفيذ المعالجة.
+
+━━━━━━━━━━━━━━━━━━
+
+مثال للقص:
+
+✂️ قص الفيديو
+
+ثم أرسل:
+
+10 60
+
+وهذا يعني:
+
+⏱ البداية = 10 ثوانٍ
+⏱ النهاية = 60 ثانية
+
+━━━━━━━━━━━━━━━━━━
+
+مثال للدقة:
+
+📐 الدقة
+
+ثم:
+
+1280x720
+
+━━━━━━━━━━━━━━━━━━
+
+مثال للصوت:
+
+🔊 الصوت
+
+ثم:
+
+1.5
+
+أي رفع الصوت إلى 150%.
+
+━━━━━━━━━━━━━━━━━━
+
+مثال للسرعة:
+
+⚡ السرعة
+
+ثم:
+
+1.25
+
+━━━━━━━━━━━━━━━━━━
+
+مثال للصيغة:
+
+🔄 الصيغة
+
+ثم:
+
+mp4
+
+أو:
+
+mkv
+webm
+mov
+mp3
+wav
+flac
+ogg
+
+━━━━━━━━━━━━━━━━━━
+
+لإلغاء أي إدخال:
+
+/cancel
+"""
+
+    await update.message.reply_text(
+        text,
+        reply_markup=main_keyboard(),
+    )
 
 
 # ============================================================
-# MEDIA UPLOAD
+# CANCEL
+# ============================================================
+
+async def cancel_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    context.user_data.pop(
+        "awaiting",
+        None,
+    )
+
+    await update.message.reply_text(
+        "❌ تم إلغاء العملية الحالية.",
+        reply_markup=main_keyboard(),
+    )
+
+
+# ============================================================
+# MEDIA RECEIVER
 # ============================================================
 
 async def handle_media(
@@ -1824,483 +1523,151 @@ async def handle_media(
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    if not update.message:
+    user = update.effective_user
+
+    if not user:
         return
 
     message = update.message
 
-    user_id = (
-        message.from_user.id
-    )
-
     telegram_file = None
+    original_name = "media"
 
-    filename = "media"
+    # --------------------------------------------------------
+    # DOCUMENT
+    # --------------------------------------------------------
 
     if message.document:
 
-        telegram_file = (
-            await message.document.get_file()
-        )
+        telegram_file = await message.document.get_file()
 
-        filename = (
+        original_name = (
             message.document.file_name
             or "media"
         )
 
+    # --------------------------------------------------------
+    # VIDEO
+    # --------------------------------------------------------
+
     elif message.video:
 
-        telegram_file = (
-            await message.video.get_file()
-        )
+        telegram_file = await message.video.get_file()
 
-        filename = "video.mp4"
+        original_name = "video.mp4"
+
+    # --------------------------------------------------------
+    # AUDIO
+    # --------------------------------------------------------
 
     elif message.audio:
 
-        telegram_file = (
-            await message.audio.get_file()
+        telegram_file = await message.audio.get_file()
+
+        original_name = (
+            message.audio.file_name
+            or "audio"
         )
 
-        filename = "audio.mp3"
+    # --------------------------------------------------------
+    # VOICE
+    # --------------------------------------------------------
 
     elif message.voice:
 
-        telegram_file = (
-            await message.voice.get_file()
-        )
+        telegram_file = await message.voice.get_file()
 
-        filename = "voice.ogg"
+        original_name = "voice.ogg"
 
-    if not telegram_file:
-
+    else:
         return
 
-    filename = safe_filename(
-        filename
+    original_name = safe_filename(
+        original_name
     )
 
-    local_path = unique_path(
+    suffix = (
+        Path(original_name).suffix
+        or ".bin"
+    )
+
+    input_path = unique_path(
         INPUT_DIR,
-        f"{user_id}_{filename}"
+        f"{uuid.uuid4().hex}{suffix}",
     )
 
     try:
 
         await telegram_file.download_to_drive(
-            custom_path=str(
-                local_path
-            )
+            custom_path=str(input_path)
         )
 
-        old_file = USER_FILES.get(
-            user_id
+        USER_FILES[user.id] = str(
+            input_path
         )
 
-        if old_file:
-
-            cleanup_file(
-                old_file
-            )
-
-        USER_FILES[user_id] = str(
-            local_path
-        )
-
-        USER_SETTINGS[user_id] = (
-            default_settings()
+        reset_user_settings(
+            user.id
         )
 
         info = await asyncio.to_thread(
             inspect_media,
-            str(local_path)
+            str(input_path),
         )
 
-        duration = info.get(
-            "duration"
-        )
+        duration = info.get("duration")
 
-        if duration:
-
+        if duration is not None:
             duration_text = (
-                f"{duration:.1f} ثانية"
+                f"{duration:.2f} ثانية"
             )
-
         else:
+            duration_text = "غير معروف"
 
-            duration_text = (
-                "غير معروف"
-            )
+        video_count = len(
+            info.get("video", [])
+        )
+
+        audio_count = len(
+            info.get("audio", [])
+        )
+
+        text = f"""
+✅ تم استلام الملف.
+
+📄 الاسم:
+{original_name}
+
+⏱ المدة:
+{duration_text}
+
+🎥 Video Streams:
+{video_count}
+
+🎵 Audio Streams:
+{audio_count}
+
+━━━━━━━━━━━━━━━━━━
+
+اختر الإعداد المطلوب:
+"""
 
         await message.reply_text(
-            (
-                "✅ تم رفع الملف بنجاح.\n\n"
-                f"📄 {filename}\n"
-                f"⏱ المدة: {duration_text}\n\n"
-                "اختر العملية المطلوبة من القائمة:"
-            ),
+            text,
             reply_markup=main_keyboard(),
         )
 
-    except Exception as e:
-
-        cleanup_file(
-            local_path
-        )
+    except Exception as exc:
 
         logger.exception(
-            "Telegram upload error"
+            "Telegram file download error"
         )
+
+        cleanup_file(input_path)
 
         await message.reply_text(
-            (
-                "❌ حدث خطأ أثناء رفع الملف:\n\n"
-                f"{str(e)[:3000]}"
-            )
+            f"❌ حدث خطأ أثناء قراءة الملف:\n\n{exc}"
         )
-
-
-# ============================================================
-# SETTINGS SUMMARY
-# ============================================================
-
-def settings_summary(
-    user_id
-):
-
-    settings = get_settings(
-        user_id
-    )
-
-    lines = []
-
-    lines.append(
-        "⚙️ الإعدادات الحالية"
-    )
-
-    lines.append(
-        "━━━━━━━━━━━━━━━━━━"
-    )
-
-    lines.append(
-        f"✂️ البداية: "
-        f"{settings.get('start') or 'تلقائي'}"
-    )
-
-    lines.append(
-        f"🏁 النهاية: "
-        f"{settings.get('end') or 'تلقائي'}"
-    )
-
-    lines.append(
-        f"🔊 الصوت: "
-        f"{settings.get('volume', 1.0)}×"
-    )
-
-    lines.append(
-        f"⚡ السرعة: "
-        f"{settings.get('speed', 1.0)}×"
-    )
-
-    width = settings.get(
-        "width"
-    )
-
-    height = settings.get(
-        "height"
-    )
-
-    resolution = (
-        f"{width}×{height}"
-        if width and height
-        else "الأصلية"
-    )
-
-    lines.append(
-        f"📐 الدقة: {resolution}"
-    )
-
-    lines.append(
-        f"🎞 FPS: "
-        f"{settings.get('fps') or 'الأصلية'}"
-    )
-
-    lines.append(
-        f"🔄 الصيغة: "
-        f"{settings.get('output_format') or 'الأصلية'}"
-    )
-
-    lines.append(
-        f"🎛 Sample Rate: "
-        f"{settings.get('sample_rate') or 'الأصلية'}"
-    )
-
-    lines.append(
-        f"🎚 Audio Bitrate: "
-        f"{settings.get('audio_bitrate') or 'افتراضي'}"
-    )
-
-    lines.append(
-        f"🎚 Video Bitrate: "
-        f"{settings.get('video_bitrate') or 'افتراضي'}"
-    )
-
-    lines.append(
-        f"🎵 استخراج الصوت: "
-        f"{'نعم' if settings.get('extract_audio') else 'لا'}"
-    )
-
-    lines.append(
-        f"🔇 كتم الصوت: "
-        f"{'نعم' if settings.get('remove_audio') else 'لا'}"
-    )
-
-    lines.append(
-        "━━━━━━━━━━━━━━━━━━"
-    )
-
-    return "\n".join(
-        lines
-    )
-
-
-# ============================================================
-# FORMAT KEYBOARD
-# ============================================================
-
-def format_keyboard():
-
-    return InlineKeyboardMarkup([
-
-        [
-            InlineKeyboardButton(
-                "🎬 MP4",
-                callback_data="setformat_mp4"
-            ),
-            InlineKeyboardButton(
-                "🎬 MKV",
-                callback_data="setformat_mkv"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "🌐 WEBM",
-                callback_data="setformat_webm"
-            ),
-            InlineKeyboardButton(
-                "🎬 MOV",
-                callback_data="setformat_mov"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "🎵 MP3",
-                callback_data="setformat_mp3"
-            ),
-            InlineKeyboardButton(
-                "🎵 WAV",
-                callback_data="setformat_wav"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "🎵 FLAC",
-                callback_data="setformat_flac"
-            ),
-            InlineKeyboardButton(
-                "🎵 M4A",
-                callback_data="setformat_m4a"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "✏️ صيغة مخصصة",
-                callback_data="custom_format"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "↩️ رجوع",
-                callback_data="back"
-            ),
-        ],
-    ])
-
-
-# ============================================================
-# RESOLUTION KEYBOARD
-# ============================================================
-
-def resolution_keyboard():
-
-    return InlineKeyboardMarkup([
-
-        [
-            InlineKeyboardButton(
-                "2160p 4K",
-                callback_data="setres_3840_2160"
-            ),
-            InlineKeyboardButton(
-                "1440p",
-                callback_data="setres_2560_1440"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "1080p",
-                callback_data="setres_1920_1080"
-            ),
-            InlineKeyboardButton(
-                "720p",
-                callback_data="setres_1280_720"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "480p",
-                callback_data="setres_854_480"
-            ),
-            InlineKeyboardButton(
-                "360p",
-                callback_data="setres_640_360"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "✏️ مخصصة",
-                callback_data="custom_resolution"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "↩️ رجوع",
-                callback_data="back"
-            ),
-        ],
-    ])
-
-
-# ============================================================
-# SPEED KEYBOARD
-# ============================================================
-
-def speed_keyboard():
-
-    return InlineKeyboardMarkup([
-
-        [
-            InlineKeyboardButton(
-                "🐢 0.5×",
-                callback_data="setspeed_0.5"
-            ),
-            InlineKeyboardButton(
-                "0.75×",
-                callback_data="setspeed_0.75"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "▶️ 1×",
-                callback_data="setspeed_1"
-            ),
-            InlineKeyboardButton(
-                "⚡ 1.25×",
-                callback_data="setspeed_1.25"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "⚡ 1.5×",
-                callback_data="setspeed_1.5"
-            ),
-            InlineKeyboardButton(
-                "🚀 2×",
-                callback_data="setspeed_2"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "✏️ سرعة مخصصة",
-                callback_data="custom_speed"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "↩️ رجوع",
-                callback_data="back"
-            ),
-        ],
-    ])
-
-
-# ============================================================
-# FPS KEYBOARD
-# ============================================================
-
-def fps_keyboard():
-
-    return InlineKeyboardMarkup([
-
-        [
-            InlineKeyboardButton(
-                "24 FPS",
-                callback_data="setfps_24"
-            ),
-            InlineKeyboardButton(
-                "25 FPS",
-                callback_data="setfps_25"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "30 FPS",
-                callback_data="setfps_30"
-            ),
-            InlineKeyboardButton(
-                "50 FPS",
-                callback_data="setfps_50"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "60 FPS",
-                callback_data="setfps_60"
-            ),
-            InlineKeyboardButton(
-                "120 FPS",
-                callback_data="setfps_120"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "✏️ مخصص",
-                callback_data="custom_fps"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "↩️ رجوع",
-                callback_data="back"
-            ),
-        ],
-    ])
 
 
 # ============================================================
@@ -2314,200 +1681,57 @@ async def callback_handler(
 
     query = update.callback_query
 
-    if not query:
-        return
-
     await query.answer()
 
-    user_id = (
-        query.from_user.id
+    user = update.effective_user
+
+    if not user:
+        return
+
+    user_id = user.id
+
+    settings = get_user_settings(
+        user_id
     )
 
     action = query.data
 
-    settings = get_settings(
-        user_id
-    )
+    # --------------------------------------------------------
+    # RESET
+    # --------------------------------------------------------
 
-    # ========================================================
-    # CANCEL
-    # ========================================================
+    if action == "reset":
 
-    if action == "cancel":
-
-        context.user_data.pop(
-            "awaiting",
-            None
+        reset_user_settings(
+            user_id
         )
 
-        await query.message.reply_text(
-            "❌ تم إلغاء العملية.",
+        await query.edit_message_text(
+            "🔄 تم إعادة ضبط جميع الإعدادات.",
             reply_markup=main_keyboard(),
         )
 
         return
 
-    # ========================================================
-    # BACK
-    # ========================================================
-
-    if action == "back":
-
-        context.user_data.pop(
-            "awaiting",
-            None
-        )
-
-        await query.message.reply_text(
-            "🎛 لوحة التحكم:",
-            reply_markup=main_keyboard(),
-        )
-
-        return
-
-    # ========================================================
-    # HELP
-    # ========================================================
-
-    if action == "help":
-
-        await query.message.reply_text(
-            HELP_TEXT,
-            reply_markup=main_keyboard(),
-        )
-
-        return
-
-    # ========================================================
-    # FILE REQUIRED
-    # ========================================================
+    # --------------------------------------------------------
+    # CHECK FILE
+    # --------------------------------------------------------
 
     if action not in {
-        "help",
         "reset",
-        "info",
-        "settings",
     }:
 
         if user_id not in USER_FILES:
 
             await query.message.reply_text(
-                "⚠️ أرسل ملف فيديو أو صوت أولًا.",
-                reply_markup=main_keyboard(),
+                "📤 أرسل فيديو أو ملف صوتي أولًا."
             )
 
             return
 
-    # ========================================================
-    # RESET
-    # ========================================================
-
-    if action == "reset":
-
-        USER_SETTINGS[user_id] = (
-            default_settings()
-        )
-
-        context.user_data.pop(
-            "awaiting",
-            None
-        )
-
-        await query.message.reply_text(
-            "🔄 تمت إعادة ضبط جميع الإعدادات.",
-            reply_markup=main_keyboard(),
-        )
-
-        return
-
-    # ========================================================
-    # INFO
-    # ========================================================
-
-    if action == "info":
-
-        if user_id not in USER_FILES:
-
-            await query.message.reply_text(
-                "⚠️ لا يوجد ملف حالي.",
-                reply_markup=main_keyboard(),
-            )
-
-            return
-
-        try:
-
-            info = await asyncio.to_thread(
-                inspect_media,
-                USER_FILES[user_id],
-            )
-
-            text = (
-                "ℹ️ معلومات الملف\n\n"
-                f"📄 {info['filename']}\n"
-                f"📦 Format: {info['format']}\n"
-                f"⏱ Duration: "
-                f"{info['duration'] or 'غير معروف'} sec\n"
-                f"💾 Bitrate: "
-                f"{info['bitrate'] or 'غير معروف'}\n\n"
-            )
-
-            for stream in info["streams"]:
-
-                if stream["type"] == "video":
-
-                    text += (
-                        "🎥 Video\n"
-                        f"Codec: {stream['codec']}\n"
-                        f"Resolution: "
-                        f"{stream.get('width')}×"
-                        f"{stream.get('height')}\n"
-                        f"FPS: {stream.get('fps')}\n\n"
-                    )
-
-                elif stream["type"] == "audio":
-
-                    text += (
-                        "🎵 Audio\n"
-                        f"Codec: {stream['codec']}\n"
-                        f"Sample Rate: "
-                        f"{stream.get('sample_rate')}\n"
-                        f"Channels: "
-                        f"{stream.get('channels')}\n\n"
-                    )
-
-            await query.message.reply_text(
-                text,
-                reply_markup=main_keyboard(),
-            )
-
-        except Exception as e:
-
-            await query.message.reply_text(
-                f"❌ تعذر قراءة الملف:\n{str(e)[:3000]}",
-                reply_markup=main_keyboard(),
-            )
-
-        return
-
-    # ========================================================
-    # SETTINGS
-    # ========================================================
-
-    if action == "settings":
-
-        await query.message.reply_text(
-            settings_summary(
-                user_id
-            ),
-            reply_markup=main_keyboard(),
-        )
-
-        return
-
-    # ========================================================
+    # --------------------------------------------------------
     # TRIM
-    # ========================================================
+    # --------------------------------------------------------
 
     if action == "trim":
 
@@ -2516,22 +1740,26 @@ async def callback_handler(
         ] = "trim"
 
         await query.message.reply_text(
-            (
-                "✂️ قص الفيديو\n\n"
-                "أرسل البداية والنهاية بالثواني.\n\n"
-                "مثال:\n"
-                "10 60\n\n"
-                "يعني من الثانية 10\n"
-                "حتى الثانية 60."
-            ),
-            reply_markup=back_keyboard(),
+            """
+✂️ قص الفيديو
+
+أرسل:
+
+البداية النهاية
+
+مثال:
+
+10 60
+
+يعني من الثانية 10 إلى الثانية 60.
+"""
         )
 
         return
 
-    # ========================================================
+    # --------------------------------------------------------
     # VOLUME
-    # ========================================================
+    # --------------------------------------------------------
 
     if action == "volume":
 
@@ -2540,74 +1768,197 @@ async def callback_handler(
         ] = "volume"
 
         await query.message.reply_text(
-            (
-                "🔊 التحكم في الصوت\n\n"
-                "أرسل معامل الصوت.\n\n"
-                "0.5 = نصف الصوت\n"
-                "1.0 = الصوت الأصلي\n"
-                "1.5 = زيادة 50%\n"
-                "2.0 = مضاعفة"
-            ),
-            reply_markup=back_keyboard(),
+            """
+🔊 مستوى الصوت
+
+أرسل قيمة مثل:
+
+1.0 = الصوت الطبيعي
+1.5 = رفع 50%
+2.0 = ضعف الصوت
+0.5 = خفض الصوت 50%
+
+مثال:
+
+1.5
+"""
         )
 
         return
 
-    # ========================================================
+    # --------------------------------------------------------
     # SPEED
-    # ========================================================
+    # --------------------------------------------------------
 
     if action == "speed":
 
+        context.user_data[
+            "awaiting"
+        ] = "speed"
+
         await query.message.reply_text(
-            "⚡ اختر سرعة المعالجة:",
-            reply_markup=speed_keyboard(),
+            """
+⚡ سرعة الفيديو
+
+أرسل مثل:
+
+0.5 = نصف السرعة
+1.0 = طبيعي
+1.25 = أسرع 25%
+1.5 = أسرع 50%
+2.0 = ضعف السرعة
+
+مثال:
+
+1.25
+"""
         )
 
         return
 
-    # ========================================================
+    # --------------------------------------------------------
     # RESOLUTION
-    # ========================================================
+    # --------------------------------------------------------
 
     if action == "resolution":
 
+        context.user_data[
+            "awaiting"
+        ] = "resolution"
+
         await query.message.reply_text(
-            "📐 اختر الدقة:",
-            reply_markup=resolution_keyboard(),
+            """
+📐 الدقة
+
+أرسل:
+
+العرضxالارتفاع
+
+أمثلة:
+
+1920x1080
+1280x720
+854x480
+640x360
+"""
         )
 
         return
 
-    # ========================================================
+    # --------------------------------------------------------
     # FPS
-    # ========================================================
+    # --------------------------------------------------------
 
     if action == "fps":
 
+        context.user_data[
+            "awaiting"
+        ] = "fps"
+
         await query.message.reply_text(
-            "🎞 اختر FPS:",
-            reply_markup=fps_keyboard(),
+            """
+🎞 معدل الإطارات FPS
+
+أرسل مثل:
+
+24
+25
+30
+50
+60
+"""
         )
 
         return
 
-    # ========================================================
+    # --------------------------------------------------------
     # FORMAT
-    # ========================================================
+    # --------------------------------------------------------
 
     if action == "format":
 
+        context.user_data[
+            "awaiting"
+        ] = "format"
+
         await query.message.reply_text(
-            "🔄 اختر صيغة الإخراج:",
-            reply_markup=format_keyboard(),
+            """
+🔄 صيغة الإخراج
+
+اختر أو اكتب:
+
+mp4
+mkv
+mov
+webm
+mp3
+wav
+flac
+ogg
+"""
         )
 
         return
 
-    # ========================================================
+    # --------------------------------------------------------
+    # BITRATE
+    # --------------------------------------------------------
+
+    if action == "bitrate":
+
+        context.user_data[
+            "awaiting"
+        ] = "bitrate"
+
+        await query.message.reply_text(
+            """
+🎚 Bitrate
+
+أرسل:
+
+VideoBitrate AudioBitrate
+
+مثال:
+
+2M 128k
+
+أو:
+
+4M 192k
+"""
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # SAMPLE RATE
+    # --------------------------------------------------------
+
+    if action == "sample":
+
+        context.user_data[
+            "awaiting"
+        ] = "sample"
+
+        await query.message.reply_text(
+            """
+🎛 Sample Rate
+
+أرسل قيمة مثل:
+
+8000
+16000
+22050
+44100
+48000
+"""
+        )
+
+        return
+
+    # --------------------------------------------------------
     # EXTRACT AUDIO
-    # ========================================================
+    # --------------------------------------------------------
 
     if action == "extract":
 
@@ -2624,18 +1975,24 @@ async def callback_handler(
         ] = "mp3"
 
         await query.message.reply_text(
-            (
-                "🎵 تم اختيار استخراج الصوت.\n\n"
-                "📦 الصيغة الحالية: MP3"
-            ),
+            """
+🎵 تم اختيار استخراج الصوت.
+
+📦 الصيغة:
+MP3
+
+اضغط الآن:
+
+🚀 تنفيذ المعالجة
+""",
             reply_markup=main_keyboard(),
         )
 
         return
 
-    # ========================================================
+    # --------------------------------------------------------
     # MUTE
-    # ========================================================
+    # --------------------------------------------------------
 
     if action == "mute":
 
@@ -2648,287 +2005,168 @@ async def callback_handler(
         ] = False
 
         await query.message.reply_text(
-            "🔇 سيتم حذف مسار الصوت من الفيديو.",
+            """
+🔇 تم تفعيل كتم الصوت.
+
+الفيديو الناتج سيكون بدون Audio Stream.
+
+اضغط:
+
+🚀 تنفيذ المعالجة
+""",
             reply_markup=main_keyboard(),
         )
 
         return
 
-    # ========================================================
-    # AUDIO BITRATE
-    # ========================================================
+    # --------------------------------------------------------
+    # INFO
+    # --------------------------------------------------------
 
-    if action == "audio_bitrate":
+    if action == "info":
 
-        context.user_data[
-            "awaiting"
-        ] = "audio_bitrate"
+        try:
 
-        await query.message.reply_text(
-            (
-                "🎚 Audio Bitrate\n\n"
-                "أرسل القيمة.\n\n"
-                "مثال:\n"
-                "96k\n"
-                "128k\n"
-                "192k\n"
-                "320k"
-            ),
-            reply_markup=back_keyboard(),
-        )
+            info = await asyncio.to_thread(
+                inspect_media,
+                USER_FILES[user_id],
+            )
 
-        return
+            text = format_media_info(
+                info
+            )
 
-    # ========================================================
-    # VIDEO BITRATE
-    # ========================================================
+            await query.message.reply_text(
+                text,
+                reply_markup=main_keyboard(),
+            )
 
-    if action == "video_bitrate":
+        except Exception as exc:
 
-        context.user_data[
-            "awaiting"
-        ] = "video_bitrate"
-
-        await query.message.reply_text(
-            (
-                "🎚 Video Bitrate\n\n"
-                "مثال:\n"
-                "1M\n"
-                "2M\n"
-                "4M\n"
-                "8M"
-            ),
-            reply_markup=back_keyboard(),
-        )
+            await query.message.reply_text(
+                f"❌ تعذر قراءة معلومات الملف:\n{exc}"
+            )
 
         return
 
-    # ========================================================
-    # SAMPLE RATE
-    # ========================================================
-
-    if action == "sample":
-
-        context.user_data[
-            "awaiting"
-        ] = "sample"
-
-        await query.message.reply_text(
-            (
-                "🎛 Sample Rate\n\n"
-                "أرسل القيمة.\n\n"
-                "44100\n"
-                "48000\n"
-                "96000"
-            ),
-            reply_markup=back_keyboard(),
-        )
-
-        return
-
-    # ========================================================
-    # CUSTOM INPUTS
-    # ========================================================
-
-    if action == "custom_speed":
-
-        context.user_data[
-            "awaiting"
-        ] = "speed"
-
-        await query.message.reply_text(
-            "⚡ أرسل السرعة، مثل:\n1.75",
-            reply_markup=back_keyboard(),
-        )
-
-        return
-
-    if action == "custom_resolution":
-
-        context.user_data[
-            "awaiting"
-        ] = "resolution"
-
-        await query.message.reply_text(
-            "📐 أرسل العرض والارتفاع.\n\nمثال:\n1920 1080",
-            reply_markup=back_keyboard(),
-        )
-
-        return
-
-    if action == "custom_fps":
-
-        context.user_data[
-            "awaiting"
-        ] = "fps"
-
-        await query.message.reply_text(
-            "🎞 أرسل FPS.\n\nمثال:\n30",
-            reply_markup=back_keyboard(),
-        )
-
-        return
-
-    if action == "custom_format":
-
-        context.user_data[
-            "awaiting"
-        ] = "format"
-
-        await query.message.reply_text(
-            "🔄 أرسل الصيغة.\n\nمثال:\nmp4",
-            reply_markup=back_keyboard(),
-        )
-
-        return
-
-    # ========================================================
-    # PRESET RESOLUTION
-    # ========================================================
-
-    if action.startswith(
-        "setres_"
-    ):
-
-        value = action.replace(
-            "setres_",
-            ""
-        )
-
-        width, height = (
-            value.split("_")
-        )
-
-        settings["width"] = int(
-            width
-        )
-
-        settings["height"] = int(
-            height
-        )
-
-        await query.message.reply_text(
-            (
-                f"✅ تم اختيار الدقة "
-                f"{width}×{height}"
-            ),
-            reply_markup=main_keyboard(),
-        )
-
-        return
-
-    # ========================================================
-    # PRESET SPEED
-    # ========================================================
-
-    if action.startswith(
-        "setspeed_"
-    ):
-
-        value = action.replace(
-            "setspeed_",
-            ""
-        )
-
-        settings["speed"] = float(
-            value
-        )
-
-        await query.message.reply_text(
-            f"✅ السرعة: {value}×",
-            reply_markup=main_keyboard(),
-        )
-
-        return
-
-    # ========================================================
-    # PRESET FPS
-    # ========================================================
-
-    if action.startswith(
-        "setfps_"
-    ):
-
-        value = action.replace(
-            "setfps_",
-            ""
-        )
-
-        settings["fps"] = float(
-            value
-        )
-
-        await query.message.reply_text(
-            f"✅ تم ضبط FPS على {value}",
-            reply_markup=main_keyboard(),
-        )
-
-        return
-
-    # ========================================================
-    # PRESET FORMAT
-    # ========================================================
-
-    if action.startswith(
-        "setformat_"
-    ):
-
-        value = action.replace(
-            "setformat_",
-            ""
-        )
-
-        settings[
-            "output_format"
-        ] = value
-
-        if value in {
-            "mp3",
-            "wav",
-            "flac",
-            "m4a",
-        }:
-
-            settings[
-                "extract_audio"
-            ] = True
-
-            settings[
-                "remove_audio"
-            ] = False
-
-        else:
-
-            settings[
-                "extract_audio"
-            ] = False
-
-        await query.message.reply_text(
-            (
-                f"✅ صيغة الإخراج: "
-                f"{value.upper()}"
-            ),
-            reply_markup=main_keyboard(),
-        )
-
-        return
-
-    # ========================================================
+    # --------------------------------------------------------
     # PROCESS
-    # ========================================================
+    # --------------------------------------------------------
 
     if action == "process":
 
         await process_telegram_file(
-            query,
-            user_id,
+            update,
+            context,
         )
 
         return
 
 
 # ============================================================
-# TEXT SETTINGS
+# MEDIA INFO FORMATTER
+# ============================================================
+
+def format_media_info(info):
+
+    lines = []
+
+    lines.append("ℹ️ معلومات الملف")
+    lines.append("")
+    lines.append(
+        f"📄 {info.get('filename')}"
+    )
+
+    if info.get("format"):
+        lines.append(
+            f"📦 Format: {info['format']}"
+        )
+
+    if info.get("duration") is not None:
+        lines.append(
+            f"⏱ Duration: {info['duration']:.2f}s"
+        )
+
+    if info.get("bitrate"):
+        lines.append(
+            f"🎚 Bitrate: {info['bitrate']} bps"
+        )
+
+    if info.get("size"):
+        size_mb = (
+            info["size"]
+            / 1024
+            / 1024
+        )
+
+        lines.append(
+            f"💾 Size: {size_mb:.2f} MB"
+        )
+
+    lines.append("")
+
+    for video in info.get(
+        "video",
+        [],
+    ):
+
+        lines.append("🎥 Video")
+
+        lines.append(
+            f"Codec: {video.get('codec')}"
+        )
+
+        lines.append(
+            f"Resolution: "
+            f"{video.get('width')}x"
+            f"{video.get('height')}"
+        )
+
+        if video.get("fps"):
+            lines.append(
+                f"FPS: {video['fps']:.2f}"
+            )
+
+        lines.append(
+            f"Pixel Format: "
+            f"{video.get('pix_fmt')}"
+        )
+
+        lines.append("")
+
+    for audio in info.get(
+        "audio",
+        [],
+    ):
+
+        lines.append("🎵 Audio")
+
+        lines.append(
+            f"Codec: {audio.get('codec')}"
+        )
+
+        lines.append(
+            f"Sample Rate: "
+            f"{audio.get('sample_rate')} Hz"
+        )
+
+        lines.append(
+            f"Channels: "
+            f"{audio.get('channels')}"
+        )
+
+        lines.append(
+            f"Layout: "
+            f"{audio.get('layout')}"
+        )
+
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+# ============================================================
+# TEXT SETTINGS HANDLER
 # ============================================================
 
 async def text_settings_handler(
@@ -2936,7 +2174,9 @@ async def text_settings_handler(
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    if not update.message:
+    user = update.effective_user
+
+    if not user:
         return
 
     awaiting = context.user_data.get(
@@ -2944,23 +2184,10 @@ async def text_settings_handler(
     )
 
     if not awaiting:
-
-        await update.message.reply_text(
-            (
-                "ℹ️ استخدم الأزرار الموجودة في لوحة التحكم.\n\n"
-                "أو أرسل /start للعودة."
-            ),
-            reply_markup=main_keyboard(),
-        )
-
         return
 
-    user_id = (
-        update.message.from_user.id
-    )
-
-    settings = get_settings(
-        user_id
+    settings = get_user_settings(
+        user.id
     )
 
     text = (
@@ -2970,101 +2197,100 @@ async def text_settings_handler(
 
     try:
 
-        # ====================================================
+        # ----------------------------------------------------
         # TRIM
-        # ====================================================
+        # ----------------------------------------------------
 
         if awaiting == "trim":
 
-            values = text.split()
+            parts = text.replace(
+                ",",
+                " ",
+            ).split()
 
-            if len(values) != 2:
-
+            if len(parts) != 2:
                 raise ValueError(
-                    "أدخل البداية والنهاية."
+                    "اكتب البداية والنهاية مثل:\n10 60"
                 )
 
-            start = float(
-                values[0]
-            )
-
-            end = float(
-                values[1]
-            )
+            start = float(parts[0])
+            end = float(parts[1])
 
             if start < 0:
-                raise ValueError()
+                raise ValueError(
+                    "البداية لا يمكن أن تكون سالبة."
+                )
 
             if end <= start:
-                raise ValueError()
+                raise ValueError(
+                    "النهاية يجب أن تكون أكبر من البداية."
+                )
 
-            settings["start"] = start
+            settings[
+                "trim_start"
+            ] = start
 
-            settings["end"] = end
+            settings[
+                "trim_end"
+            ] = end
 
-        # ====================================================
+        # ----------------------------------------------------
         # VOLUME
-        # ====================================================
+        # ----------------------------------------------------
 
         elif awaiting == "volume":
 
-            value = float(
-                text
+            value = parse_float(
+                text,
+                minimum=0,
+                maximum=10,
             )
-
-            if value < 0:
-                raise ValueError()
 
             settings[
                 "volume"
             ] = value
 
-        # ====================================================
+        # ----------------------------------------------------
         # SPEED
-        # ====================================================
+        # ----------------------------------------------------
 
         elif awaiting == "speed":
 
-            value = float(
-                text
+            value = parse_float(
+                text,
+                minimum=0.1,
+                maximum=4.0,
             )
-
-            if value <= 0:
-                raise ValueError()
-
-            if value > 10:
-                raise ValueError()
 
             settings[
                 "speed"
             ] = value
 
-        # ====================================================
+        # ----------------------------------------------------
         # RESOLUTION
-        # ====================================================
+        # ----------------------------------------------------
 
         elif awaiting == "resolution":
 
-            values = text.split()
-
-            if len(values) != 2:
-
-                raise ValueError()
-
-            width = int(
-                values[0]
+            normalized = (
+                text.lower()
+                .replace("×", "x")
             )
 
-            height = int(
-                values[1]
-            )
+            parts = normalized.split("x")
 
-            if (
-                width < 16
-                or height < 16
-            ):
+            if len(parts) != 2:
+                raise ValueError(
+                    "استخدم الشكل:\n1280x720"
+                )
 
-                raise ValueError()
+            width = int(parts[0])
+            height = int(parts[1])
+
+            if width <= 0 or height <= 0:
+                raise ValueError(
+                    "الدقة يجب أن تكون موجبة."
+                )
 
             settings[
                 "width"
@@ -3074,143 +2300,113 @@ async def text_settings_handler(
                 "height"
             ] = height
 
-        # ====================================================
+        # ----------------------------------------------------
         # FPS
-        # ====================================================
+        # ----------------------------------------------------
 
         elif awaiting == "fps":
 
-            value = float(
-                text
+            value = parse_float(
+                text,
+                minimum=1,
+                maximum=240,
             )
-
-            if (
-                value <= 0
-                or value > 240
-            ):
-
-                raise ValueError()
 
             settings[
                 "fps"
             ] = value
 
-        # ====================================================
+        # ----------------------------------------------------
         # FORMAT
-        # ====================================================
+        # ----------------------------------------------------
 
         elif awaiting == "format":
 
             value = (
-                text
-                .lower()
-                .replace(
-                    ".",
-                    ""
-                )
+                text.lower()
+                .replace(".", "")
+                .strip()
             )
 
             allowed = {
                 "mp4",
                 "mkv",
-                "webm",
                 "mov",
+                "webm",
                 "mp3",
                 "wav",
                 "flac",
-                "m4a",
+                "ogg",
             }
 
             if value not in allowed:
-
-                raise ValueError()
+                raise ValueError(
+                    "الصيغة غير مدعومة."
+                )
 
             settings[
                 "output_format"
             ] = value
 
-            if value in {
-                "mp3",
-                "wav",
-                "flac",
-                "m4a",
-            }:
+        # ----------------------------------------------------
+        # BITRATE
+        # ----------------------------------------------------
+
+        elif awaiting == "bitrate":
+
+            parts = text.split()
+
+            if len(parts) == 1:
+
+                value = parts[0]
 
                 settings[
-                    "extract_audio"
-                ] = True
+                    "video_bitrate"
+                ] = value
 
                 settings[
-                    "remove_audio"
-                ] = False
+                    "audio_bitrate"
+                ] = "128k"
+
+            elif len(parts) == 2:
+
+                settings[
+                    "video_bitrate"
+                ] = parts[0]
+
+                settings[
+                    "audio_bitrate"
+                ] = parts[1]
 
             else:
 
+                raise ValueError(
+                    "مثال:\n2M 128k"
+                )
+
+            parse_bitrate(
                 settings[
-                    "extract_audio"
-                ] = False
+                    "video_bitrate"
+                ]
+            )
 
-        # ====================================================
-        # AUDIO BITRATE
-        # ====================================================
+            parse_bitrate(
+                settings[
+                    "audio_bitrate"
+                ]
+            )
 
-        elif awaiting == "audio_bitrate":
-
-            value = text
-
-            if parse_bitrate(
-                value
-            ) is None:
-
-                raise ValueError()
-
-            settings[
-                "audio_bitrate"
-            ] = value
-
-        # ====================================================
-        # VIDEO BITRATE
-        # ====================================================
-
-        elif awaiting == "video_bitrate":
-
-            value = text
-
-            if parse_bitrate(
-                value
-            ) is None:
-
-                raise ValueError()
-
-            settings[
-                "video_bitrate"
-            ] = value
-
-        # ====================================================
+        # ----------------------------------------------------
         # SAMPLE RATE
-        # ====================================================
+        # ----------------------------------------------------
 
         elif awaiting == "sample":
 
-            value = int(
-                text
+            value = parse_int(
+                text,
+                minimum=8000,
+                maximum=192000,
             )
-
-            allowed_rates = {
-                8000,
-                16000,
-                22050,
-                24000,
-                32000,
-                44100,
-                48000,
-                88200,
-                96000,
-            }
-
-            if value not in allowed_rates:
-
-                raise ValueError()
 
             settings[
                 "sample_rate"
@@ -3218,86 +2414,82 @@ async def text_settings_handler(
 
         context.user_data.pop(
             "awaiting",
-            None
+            None,
         )
 
         await update.message.reply_text(
-            (
-                "✅ تم حفظ الإعداد.\n\n"
-                "يمكنك الآن اختيار إعداد آخر "
-                "أو الضغط على 🚀 تنفيذ."
-            ),
+            "✅ تم حفظ الإعداد.\n\n"
+            "يمكنك اختيار إعداد آخر أو الضغط على:\n"
+            "🚀 تنفيذ المعالجة",
             reply_markup=main_keyboard(),
         )
 
-    except Exception:
+    except Exception as exc:
 
         await update.message.reply_text(
-            (
-                "❌ القيمة غير صحيحة.\n\n"
-                "أعد إرسالها بالقيمة المطلوبة."
-            ),
-            reply_markup=back_keyboard(),
+            f"❌ قيمة غير صحيحة.\n\n{exc}\n\n"
+            "حاول مرة أخرى."
         )
 
 
 # ============================================================
-# TELEGRAM PROCESS
+# TELEGRAM PROCESSING
 # ============================================================
 
 async def process_telegram_file(
-    query,
-    user_id,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    if user_id not in USER_FILES:
+    user = update.effective_user
 
-        await query.message.reply_text(
-            "⚠️ أرسل ملفًا أولًا.",
-            reply_markup=main_keyboard(),
-        )
-
+    if not user:
         return
 
-    input_path = Path(
-        USER_FILES[user_id]
-    )
+    user_id = user.id
 
-    settings = get_settings(
+    input_path = USER_FILES.get(
         user_id
     )
 
-    if not input_path.exists():
+    if not input_path:
 
-        USER_FILES.pop(
-            user_id,
-            None
-        )
-
-        await query.message.reply_text(
-            "❌ الملف لم يعد موجودًا على السيرفر.\n"
-            "أرسل الملف مرة أخرى.",
-            reply_markup=main_keyboard(),
+        await update.effective_message.reply_text(
+            "📤 أرسل ملفًا أولًا."
         )
 
         return
 
-    await query.message.reply_text(
-        (
-            "🚀 بدأت المعالجة...\n\n"
-            "🧠 Engine: PyAV\n"
-            "🚫 External FFmpeg: لا\n\n"
-            "⚙️ الإعدادات:\n"
-            f"{settings_summary(user_id)}\n\n"
-            "⏳ انتظر حتى اكتمال العملية..."
-        ),
-    )
+    if not Path(input_path).exists():
 
-    extension = (
+        USER_FILES.pop(
+            user_id,
+            None,
+        )
+
+        await update.effective_message.reply_text(
+            "❌ الملف لم يعد موجودًا على السيرفر.\n"
+            "📤 أرسله مرة أخرى."
+        )
+
+        return
+
+    settings = get_user_settings(
+        user_id
+    ).copy()
+
+    # --------------------------------------------------------
+    # DETERMINE FORMAT
+    # --------------------------------------------------------
+
+    output_format = (
         settings.get(
             "output_format"
         )
-        or input_path.suffix.lstrip(".")
+        or Path(input_path)
+        .suffix
+        .lstrip(".")
+        .lower()
         or "mp4"
     )
 
@@ -3305,29 +2497,37 @@ async def process_telegram_file(
         "extract_audio"
     ):
 
-        extension = (
-            settings.get(
-                "output_format"
-            )
-            or "mp3"
-        )
+        output_format = "mp3"
 
-    extension = (
-        extension
-        .lower()
-        .replace(
-            ".",
-            ""
-        )
+    settings[
+        "output_format"
+    ] = output_format
+
+    input_name = safe_filename(
+        Path(input_path).name
     )
 
-    output_path = (
-        OUTPUT_DIR
-        / (
-            f"{input_path.stem}"
-            f"_result_"
-            f"{uuid.uuid4().hex[:8]}"
-            f".{extension}"
+    output_name = (
+        Path(input_name).stem
+        + "_processed."
+        + output_format
+    )
+
+    output_path = unique_path(
+        OUTPUT_DIR,
+        output_name,
+    )
+
+    status_message = (
+        await update.effective_message.reply_text(
+            """
+⏳ جاري معالجة الملف...
+
+⚙️ المحرك: PyAV
+🚫 FFmpeg executable: غير مستخدم
+
+قد تستغرق العملية بعض الوقت حسب حجم الملف.
+"""
         )
     )
 
@@ -3336,88 +2536,127 @@ async def process_telegram_file(
         await asyncio.to_thread(
             process_media_pyav,
             input_path,
-            output_path,
+            str(output_path),
             settings,
         )
 
-        if not output_path.exists():
+        # ----------------------------------------------------
+        # SEND FILE
+        # ----------------------------------------------------
 
-            raise RuntimeError(
-                "لم يتم إنشاء الملف الناتج."
-            )
-
-        file_size = (
-            output_path.stat().st_size
-        )
-
-        size_mb = (
-            file_size
-            / 1024
-            / 1024
-        )
-
-        await query.message.reply_text(
-            (
-                "✅ اكتملت المعالجة بنجاح.\n\n"
-                f"📦 الحجم: {size_mb:.2f} MB\n"
-                "📤 جاري إرسال الملف..."
-            )
-        )
-
-        with open(
-            output_path,
-            "rb"
-        ) as file:
-
-            await query.message.reply_document(
-                document=file,
-                filename=output_path.name,
-                caption=(
-                    "🎬 PyAV Media Studio\n"
-                    "✅ تم إنشاء الملف بنجاح."
-                ),
-            )
-
-    except Exception as e:
-
-        logger.exception(
-            "Telegram processing error"
-        )
-
-        await query.message.reply_text(
-            (
-                "❌ حدث خطأ أثناء المعالجة.\n\n"
-                f"{str(e)[:4000]}"
+        await update.effective_message.reply_document(
+            document=str(output_path),
+            filename=output_name,
+            caption=(
+                "✅ تمت المعالجة بنجاح!\n\n"
+                f"📦 الصيغة: {output_format}\n"
+                "⚙️ Engine: PyAV"
             ),
-            reply_markup=main_keyboard(),
         )
 
-    finally:
+        try:
+            await status_message.delete()
+        except Exception:
+            pass
+
+        # ----------------------------------------------------
+        # CLEANUP
+        # ----------------------------------------------------
+
+        cleanup_file(
+            input_path
+        )
 
         cleanup_file(
             output_path
         )
 
+        USER_FILES.pop(
+            user_id,
+            None,
+        )
+
+        reset_user_settings(
+            user_id
+        )
+
+        context.user_data.pop(
+            "awaiting",
+            None,
+        )
+
+    except Exception as exc:
+
+        logger.exception(
+            "Telegram processing failed"
+        )
+
+        cleanup_file(
+            output_path
+        )
+
+        await update.effective_message.reply_text(
+            "❌ حدث خطأ أثناء معالجة الملف.\n\n"
+            f"التفاصيل:\n{exc}\n\n"
+            "📤 يمكنك إرسال الملف مرة أخرى والمحاولة."
+        )
+
 
 # ============================================================
-# HANDLER REGISTRATION
+# UNKNOWN TEXT
 # ============================================================
 
-def register_handlers(
-    application: Application
+async def unknown_text(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    if context.user_data.get(
+        "awaiting"
+    ):
+        return
+
+    await update.message.reply_text(
+        """
+🤖 لم أفهم الأمر.
+
+📤 أرسل فيديو أو ملف صوتي،
+أو استخدم:
+
+/start
+/help
+/cancel
+""",
+        reply_markup=main_keyboard(),
+    )
+
+
+# ============================================================
+# REGISTER BOT HANDLERS
+# ============================================================
+
+def register_bot_handlers(
+    application: Application,
 ):
 
     application.add_handler(
         CommandHandler(
             "start",
-            start_command
+            start_command,
         )
     )
 
     application.add_handler(
         CommandHandler(
             "help",
-            help_command
+            help_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "cancel",
+            cancel_command,
         )
     )
 
@@ -3426,6 +2665,10 @@ def register_handlers(
             callback_handler
         )
     )
+
+    # --------------------------------------------------------
+    # MEDIA
+    # --------------------------------------------------------
 
     application.add_handler(
         MessageHandler(
@@ -3439,6 +2682,10 @@ def register_handlers(
         )
     )
 
+    # --------------------------------------------------------
+    # TEXT SETTINGS
+    # --------------------------------------------------------
+
     application.add_handler(
         MessageHandler(
             filters.TEXT
@@ -3449,62 +2696,7 @@ def register_handlers(
 
 
 # ============================================================
-# OPTIONAL CLEANUP
-# ============================================================
-
-async def cleanup_old_files():
-
-    while True:
-
-        try:
-
-            await asyncio.sleep(
-                30 * 60
-            )
-
-            for directory in (
-                INPUT_DIR,
-                OUTPUT_DIR,
-            ):
-
-                for file in directory.iterdir():
-
-                    try:
-
-                        if not file.is_file():
-                            continue
-
-                        age = (
-                            __import__(
-                                "time"
-                            ).time()
-                            - file.stat().st_mtime
-                        )
-
-                        if age > (
-                            2 * 60 * 60
-                        ):
-
-                            file.unlink(
-                                missing_ok=True
-                            )
-
-                    except Exception:
-                        pass
-
-        except asyncio.CancelledError:
-
-            break
-
-        except Exception:
-
-            logger.exception(
-                "Cleanup worker error"
-            )
-
-
-# ============================================================
-# MAIN
+# UVICORN ENTRYPOINT
 # ============================================================
 
 if __name__ == "__main__":
